@@ -22,32 +22,34 @@
 
 //Parameters
 #define ANALOG_PIN A0          //Set the ADC pin used
-#define ANALOG_REF 5           //Analog Reference is +5V for Arduino UNO R3
-#define ADC_RESOLUTION 10      //Set the ADC resolution. It is 10 by default for Arduino UNO R3
-#define calibrationValue 0     //Temperature measurement calibration value
+#define ANALOG_REF 5.0         //Analog Reference is +5V for Arduino UNO R3
+#define calibrationValue 0.57  //Temperature measurement calibration value
 #define circularBufferSize 5   //Size of the circular buffer to determine that measurement is stable
 #define readingStableDelta 2   //Maximum delta to initially determine that temperature has stabilized
 
 //Measurement Variables
-float rawAnalogInput;
-float voltageInput;
-float temperatureInputC;
-float temperatureInputF;
-bool newMeasurement;
-byte ISRCounter;
+volatile float rawAnalogInput;        //Analog input read by ISR
+float localRaw = 0.0;                 //Analog input copied in main loop
+float voltageInput;                   //Calculated voltage input based on analog reference
+float temperatureInputC;              //Calculated input temperature in C
+float temperatureInputF;              //Calculated input temperature in F
+volatile bool newMeasurement = false; //ISR flag to main loop if a new measurement is available
+volatile byte ISRCounter = 0;         //ISR counter how many interrupts occured
 
-//Circular Buffer
-float rawAnalogInputBuffer[circularBufferSize];
+//Circular Buffer Variables
+float rawAnalogInputBuffer[circularBufferSize] = {0.0, 0.0, 0.0, 0.0, 0.0};
 byte rawAnalogInputIndex = 0;
 int readingCount = 0;
-bool stabilizedReading = false;
+volatile bool stabilizedReading = false;
 float maxReadingDelta = 0;
+volatile unsigned long secondsSinceStart = 0;  //Seconds since recording started incremented by ISR
+unsigned long localSecondsSinceStart = 0;      //Local seconds since start copied in main loop
 
 //Arduino UNO R3 Specifications:
 //Default: 10-bit ADC
 //Map input voltages: (0, +5VDC) -> (0, 1023)
-//Resolution: 5 V / 1024 units or 0.0049 volts (4.9 mV) per unit.
-float analogToVoltageMultiplier = (ANALOG_REF / (pow(2, ADC_RESOLUTION)-1));
+//Resolution: 5 V / 1023 units or 0.0049 volts (4.9 mV) per unit.
+float analogToVoltageMultiplier = ANALOG_REF / 1023.0;
 
 void setup() {
   //Arduino Uno R3 Timer #1 Setup
@@ -61,17 +63,23 @@ void setup() {
   TCCR1A = 0;               // Reset entire TCCR1A to 0 
   TCCR1B = 0;               // Reset entire TCCR1B to 0
   TCCR1B |= B00000100;      // Set CS12 | CS11 | CS10 to 100 so we get prescalar 256  
-  TIMSK1 |= B00000010;      // Set OCIE1A to 1 so we enable compare match A 
-  OCR1A = 62500;            // Set OCR register for compare
+  TIMSK1 |= B00000010;      // Set OCIE1A to 1 so we enable compare match A
+  OCR1A = 62500 - 1;        // Set OCR register for compare (Counts are 0..OCR1A inclusive)
   Serial.begin(9600);
   analogReference(DEFAULT); //Set analog read resolution
   Serial.println("Initial temperature readings started!");
+  Serial.println("Data format: [Time],[Temperature in F]");
   sei();                    //Enable back the interrupts
 }
 void loop() {
   // Measurement
   if (newMeasurement) {
-    voltageInput = rawAnalogInput * analogToVoltageMultiplier; 
+    noInterrupts();            //Begin critical section
+    localRaw = rawAnalogInput; //Copy analog input read by ISR
+    localSecondsSinceStart = secondsSinceStart;
+    newMeasurement = false;    //Flag for new measurement
+    interrupts();              //End critical section
+    voltageInput = localRaw * analogToVoltageMultiplier;
     temperatureInputC = (voltageInput - 1.25) / 0.005;
     temperatureInputF = temperatureInputC*1.8 + 32;
     
@@ -84,11 +92,12 @@ void loop() {
       rawAnalogInputIndex = 0;
       readingCount++;
     }
+    Serial.print(localSecondsSinceStart);
+    Serial.print(",");
     Serial.println(temperatureInputF + calibrationValue);
-    newMeasurement = false;
   }
 
-  // Stabilization
+  // Stabilization Calculation
   if (!stabilizedReading) {
     maxReadingDelta = 0;
     for (byte i = 0; i <= circularBufferSize - 2; i++) {
@@ -96,16 +105,16 @@ void loop() {
         maxReadingDelta = abs(rawAnalogInputBuffer[i+1] - rawAnalogInputBuffer[i]);
       }
     }
-    if (maxReadingDelta <= readingStableDelta && readingCount > circularBufferSize) {
+    if (maxReadingDelta <= readingStableDelta && readingCount > circularBufferSize - 1) {
       stabilizedReading = true;
       Serial.println("Initial temperature readings have stabilized.");
     }
   }
   //Error checking - should only have values between 0 and 1023
-  if (rawAnalogInput < 0) {
+  if (localRaw < 0.0) {
     Serial.println("Analog Read Low Error! Value less than zero.");
   }
-  if (rawAnalogInput > 1023) {
+  if (localRaw > 1023.0) {
     Serial.println("Analog Read High Error! Value more than 1023.");
   }
 }
@@ -116,15 +125,16 @@ void loop() {
 ISR(TIMER1_COMPA_vect){
   //Set the timer back to 0 to reset for the next interrupt
   TCNT1  = 0;
+  secondsSinceStart++; //Increment seconds since start
   if (!stabilizedReading) {
     //If readings are not stabilized, read every second
-    rawAnalogInput = analogRead(ANALOG_PIN);
+    rawAnalogInput = analogRead(ANALOG_PIN); //Okay to do analogRead at 1 Hz
     newMeasurement = true;
   } else {
     //If readings are stabilized, read every 10 seconds
     ISRCounter++; //Increase the counter every second
-    if (ISRCounter == 10) {
-      rawAnalogInput = analogRead(ANALOG_PIN);
+    if (ISRCounter >= 10) {
+      rawAnalogInput = analogRead(ANALOG_PIN); //Okay to do analogRead at 0.1 Hz
       newMeasurement = true;
       ISRCounter = 0;
     }
